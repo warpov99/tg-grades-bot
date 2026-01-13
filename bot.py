@@ -1,8 +1,12 @@
+import os
+from dotenv import load_dotenv
 import asyncio
 import sqlite3
 import logging
 import random
 from datetime import datetime
+
+load_dotenv()
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -11,11 +15,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ========= НАСТРОЙКИ =========
-TOKEN = "PASTE_YOUR_TOKEN_HERE"
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise SystemExit("TOKEN не найден. Создай .env и добавь TOKEN=...")
 
-# ВСТАВЬ СЮДА СВОЙ TG ID (можно несколько)
-# Узнать свой ID можно у бота @userinfobot
-ADMIN_IDS = {123456789}
+raw_admins = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = {int(x.strip()) for x in raw_admins.split(",") if x.strip().isdigit()}
+print("ADMIN_IDS =", ADMIN_IDS)
 
 
 # Код доступа (авторизация) для регистрации. Если не нужен — оставь пустую строку ""
