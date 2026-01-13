@@ -8,15 +8,18 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ========= НАСТРОЙКИ =========
 TOKEN = "PASTE_YOUR_TOKEN_HERE"
 
 # ВСТАВЬ СЮДА СВОЙ TG ID (можно несколько)
 # Узнать свой ID можно у бота @userinfobot
-ADMIN_IDS = {1234567890}
+ADMIN_IDS = {123456789}
 
+
+# Код доступа (авторизация) для регистрации. Если не нужен — оставь пустую строку ""
+REQUEST_COOLDOWN_SEC = 600  # 10 минут
 DB_NAME = "grades.db"
 
 # ========= ЛОГИ =========
@@ -32,6 +35,7 @@ BTN_CAB = "📊 Личный кабинет"
 BTN_TOP = "🏆 Лидерборд"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "❌ Отмена"
+BTN_GET_CODE = "📩 Запросить доступ"
 
 BTN_DEL_ONE = "🗑 Удалить одну оценку"
 BTN_DEL_ALL = "🧹 Удалить все оценки"
@@ -76,6 +80,17 @@ def main_kb(tg_id: int) -> ReplyKeyboardMarkup:
 def cancel_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
+        resize_keyboard=True
+    )
+
+
+def unauth_kb() -> ReplyKeyboardMarkup:
+    # Клавиатура для неавторизованного пользователя: запросить код у админа или отмена
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_GET_CODE)],
+            [KeyboardButton(text=BTN_CANCEL)],
+        ],
         resize_keyboard=True
     )
 
@@ -181,7 +196,8 @@ def db_init():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         tg_id INTEGER PRIMARY KEY,
-        full_name TEXT NOT NULL
+        full_name TEXT NOT NULL,
+        is_verified INTEGER NOT NULL DEFAULT 0
     )
     """)
 
@@ -200,6 +216,36 @@ def db_init():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(tg_id) REFERENCES users(tg_id),
         FOREIGN KEY(subject) REFERENCES subjects(name)
+    )
+    """)
+
+
+    # Миграции (если база уже существовала)
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_achievements (
+        tg_id INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        unlocked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (tg_id, code),
+        FOREIGN KEY(tg_id) REFERENCES users(tg_id)
+    )
+    """)
+    
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS access_requests (
+        tg_id INTEGER PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        username TEXT,
+        status TEXT NOT NULL,
+        requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        last_request_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        handled_by INTEGER,
+        handled_at TEXT
     )
     """)
 
@@ -285,6 +331,110 @@ def upsert_user(tg_id: int, full_name: str):
     conn.commit()
     conn.close()
 
+def set_user_verified(tg_id: int, verified: int = 1):
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET is_verified=? WHERE tg_id=?", (verified, tg_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def parse_sqlite_ts(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+
+def get_access_request(tg_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM access_requests WHERE tg_id=?", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def upsert_access_request_pending(tg_id: int, full_name: str, username: str | None):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO access_requests(tg_id, full_name, username, status, requested_at, last_request_at)
+        VALUES(?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(tg_id) DO UPDATE SET
+            full_name=excluded.full_name,
+            username=excluded.username,
+            status='pending',
+            requested_at=CURRENT_TIMESTAMP,
+            last_request_at=CURRENT_TIMESTAMP
+    """, (tg_id, full_name, username))
+    conn.commit()
+    conn.close()
+
+
+def set_access_request_status(tg_id: int, status: str, admin_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE access_requests
+        SET status=?, handled_by=?, handled_at=CURRENT_TIMESTAMP
+        WHERE tg_id=?
+    """, (status, admin_id, tg_id))
+    conn.commit()
+    conn.close()
+
+def is_user_verified(tg_id: int) -> bool:
+    u = get_user(tg_id)
+    if not u:
+        return False
+    try:
+        return int(u["is_verified"]) == 1
+    except Exception:
+        return True
+
+# ====== Достижения ======
+ACHIEVEMENTS = {
+    "first_grade": ("🥉 Первый тест", "Добавь первую оценку"),
+    "ten_tests": ("🥈 10 тестов", "Добавь 10 оценок"),
+    "streak3_5": ("🥇 Серия пятёрок", "Получить 3 пятёрки подряд"),
+    "avg_45": ("🏅 Отличник", "Достичь общей средней 4.50+ (минимум 5 оценок)"),
+}
+
+def unlock_achievement(tg_id: int, code: str) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO user_achievements(tg_id, code) VALUES(?, ?)",
+        (tg_id, code)
+    )
+    conn.commit()
+    changed = cur.rowcount == 1
+    conn.close()
+    return changed
+
+def get_total_count_and_avg(tg_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS cnt, AVG(grade) AS avg FROM grades WHERE tg_id=?", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row["cnt"] or 0), (row["avg"] if row else None)
+
+def get_last_grades(tg_id: int, limit: int = 3):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT grade FROM grades WHERE tg_id=? ORDER BY id DESC LIMIT ?", (tg_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return [float(r["grade"]) for r in rows]
+
 
 def list_users(limit: int = 30):
     conn = db_connect()
@@ -360,13 +510,20 @@ def get_cabinet_stats(tg_id: int):
     total = cur.fetchone()
 
     cur.execute("""
-        SELECT subject,
-               ROUND(AVG(grade), 2) AS avg_subj,
-               COUNT(*) AS cnt
-        FROM grades
-        WHERE tg_id=?
-        GROUP BY subject
-        ORDER BY subject ASC
+        SELECT
+            g.subject AS subject,
+            ROUND(AVG(g.grade), 2) AS avg_subj,
+            COUNT(*) AS cnt,
+            MAX(g.grade) AS best_grade,
+            (SELECT grade
+             FROM grades g2
+             WHERE g2.tg_id = g.tg_id AND g2.subject = g.subject
+             ORDER BY g2.id DESC
+             LIMIT 1) AS last_grade
+        FROM grades g
+        WHERE g.tg_id=?
+        GROUP BY g.subject
+        ORDER BY g.subject ASC
     """, (tg_id,))
     by_subject = cur.fetchall()
 
@@ -522,11 +679,27 @@ async def main():
     async def start(m: Message, state: FSMContext):
         await state.clear()
         user = get_user(m.from_user.id)
-        if user:
-            log.info("start: known user tg_id=%s name=%s", m.from_user.id, user["full_name"])
-            await m.answer(f"Привет, {user['full_name']}! 👇", reply_markup=main_kb(m.from_user.id))
+
+        # Уже авторизован
+        if user and is_user_verified(m.from_user.id):
+            log.info("start: verified user tg_id=%s name=%s", m.from_user.id, user["full_name"])
+            await m.answer(
+                f"Привет, {user['full_name']}! 👇",
+                reply_markup=main_kb(m.from_user.id)
+            )
             return
 
+        # Есть в базе, но не авторизован -> только заявка
+        if user and not is_user_verified(m.from_user.id):
+            log.info("start: not verified tg_id=%s name=%s", m.from_user.id, user["full_name"])
+            await m.answer(
+                "🔒 Доступ к функциям бота пока не выдан.\n"
+                "Нажми «📩 Запросить доступ», чтобы отправить заявку админу.",
+                reply_markup=unauth_kb()
+            )
+            return
+
+        # Новый пользователь -> регистрация (Имя Фамилия)
         log.info("start: new user tg_id=%s username=@%s", m.from_user.id, m.from_user.username)
         await m.answer(
             "Привет! Зарегистрируйся.\n"
@@ -535,7 +708,6 @@ async def main():
             reply_markup=cancel_kb()
         )
         await state.set_state(Reg.full_name)
-
     @dp.message(Reg.full_name)
     async def reg_full_name(m: Message, state: FSMContext):
         full_name = (m.text or "").strip()
@@ -546,15 +718,155 @@ async def main():
 
         upsert_user(m.from_user.id, full_name)
         log.info("registered tg_id=%s name=%s", m.from_user.id, full_name)
-        await state.clear()
-        await m.answer(f"✅ Готово, {full_name}!", reply_markup=main_kb(m.from_user.id))
 
-    # --- Личный кабинет
+        await state.clear()
+        await m.answer(
+            f"✅ Регистрация сохранена: *{full_name}*.\n"
+            "Теперь запроси доступ у администратора кнопкой ниже.",
+            parse_mode="Markdown",
+            reply_markup=unauth_kb()
+        )
+    @dp.message(F.text == BTN_GET_CODE)
+    async def request_access(m: Message):
+        """
+        Авторизация по заявкам (без кода).
+        Пользователь нажимает "Запросить доступ" -> бот отправляет заявку админу.
+        Защита от спама: повторная заявка запрещена, если уже pending; после отказа действует кулдаун.
+        """
+        user_row = get_user(m.from_user.id)
+        if not user_row:
+            await m.answer("Сначала зарегистрируйся через /start (Имя Фамилия).", reply_markup=cancel_kb())
+            return
+
+        # если уже верифицирован — просто показать меню
+        if is_user_verified(m.from_user.id):
+            await m.answer("✅ Ты уже авторизован.", reply_markup=main_kb(m.from_user.id))
+            return
+
+        # анти-спам и кулдаун
+        req = get_access_request(m.from_user.id)
+        now = datetime.utcnow()
+
+        if req and req["status"] == "pending":
+            await m.answer("⏳ Твоя заявка уже отправлена и ожидает решения администратора.", reply_markup=unauth_kb())
+            return
+
+        if req and req["status"] == "denied":
+            last = req["last_request_at"] or req["handled_at"] or req["requested_at"]
+            last_dt = parse_sqlite_ts(last)
+            if last_dt:
+                seconds = int((now - last_dt).total_seconds())
+                if seconds < REQUEST_COOLDOWN_SEC:
+                    wait = REQUEST_COOLDOWN_SEC - seconds
+                    mins = (wait + 59) // 60
+                    await m.answer(f"⛔ Заявка недавно отклонена. Попробуй снова через ~{mins} мин.", reply_markup=unauth_kb())
+                    return
+
+        full_name = user_row["full_name"]
+        username = f"@{m.from_user.username}" if m.from_user.username else None
+
+        upsert_access_request_pending(m.from_user.id, full_name, username)
+
+        # сообщение админу с кнопками
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"auth:accept:{m.from_user.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"auth:deny:{m.from_user.id}")
+        ]])
+
+        admin_text = (
+            "📩 Заявка на доступ\n"
+            f"ID: {m.from_user.id}\n"
+            f"Имя (в боте): {full_name}\n"
+            f"Username: {username or '(нет username)'}"
+        )
+
+        sent_any = False
+        for admin_id in ADMIN_IDS:
+            try:
+                await m.bot.send_message(admin_id, admin_text, reply_markup=kb)
+                sent_any = True
+            except Exception:
+                pass
+
+        if sent_any:
+            await m.answer("✅ Заявка отправлена администратору. Ожидай решения.", reply_markup=unauth_kb())
+        else:
+            await m.answer("⚠️ Не удалось отправить заявку админу. Попробуй позже.", reply_markup=unauth_kb())
+
+    @dp.callback_query(F.data.startswith("auth:"))
+    async def auth_decision(q: CallbackQuery):
+        # доступ только админу
+        if not is_admin(q.from_user.id):
+            await q.answer("Нет доступа.", show_alert=True)
+            return
+
+        try:
+            _, action, tg_id_str = (q.data or "").split(":")
+            target_id = int(tg_id_str)
+        except Exception:
+            await q.answer("Неверные данные.", show_alert=True)
+            return
+
+        target_user = get_user(target_id)
+        target_name = target_user["full_name"] if target_user else f"tg_id={target_id}"
+
+        admin_username = f"@{q.from_user.username}" if q.from_user.username else f"ID {q.from_user.id}"
+
+        if action == "accept":
+            set_user_verified(target_id, 1)
+            set_access_request_status(target_id, "approved", q.from_user.id)
+
+            try:
+                await q.bot.send_message(
+                    target_id,
+                    f"✅ Доступ одобрен администратором {admin_username}.\n"
+                    "Нажми /start, чтобы открыть меню."
+                )
+            except Exception:
+                pass
+
+            try:
+                await q.message.edit_text(
+                    (q.message.text or "") + f"\n\n✅ Принято админом {admin_username}",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+
+            await q.answer("Принято.")
+
+        elif action == "deny":
+            set_access_request_status(target_id, "denied", q.from_user.id)
+
+            try:
+                await q.bot.send_message(
+                    target_id,
+                    f"❌ Доступ отклонён администратором {admin_username}.\n"
+                    f"По вопросам напиши: {admin_username}"
+                )
+            except Exception:
+                pass
+
+            try:
+                await q.message.edit_text(
+                    (q.message.text or "") + f"\n\n❌ Отклонено админом {admin_username}",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+
+            await q.answer("Отклонено.")
+        else:
+            await q.answer("Неизвестное действие.", show_alert=True)
+
     @dp.message(F.text == BTN_CAB)
     async def cabinet(m: Message):
         user = get_user(m.from_user.id)
         if not user:
             await m.answer("Сначала /start", reply_markup=ReplyKeyboardRemove())
+            return
+        if not is_user_verified(m.from_user.id):
+            await m.answer("🔒 Доступ не выдан. Нажми «📩 Запросить доступ» и дождись решения админа.", reply_markup=unauth_kb())
             return
 
         total, by_subject = get_cabinet_stats(m.from_user.id)
@@ -581,6 +893,9 @@ async def main():
         if not user:
             await m.answer("Сначала /start", reply_markup=ReplyKeyboardRemove())
             return
+        if not is_user_verified(m.from_user.id):
+            await m.answer("🔒 Доступ не выдан. Нажми «📩 Запросить доступ» и дождись решения админа.", reply_markup=unauth_kb())
+            return
 
         rows = get_top(limit=10)
         if not rows:
@@ -599,6 +914,9 @@ async def main():
         user = get_user(m.from_user.id)
         if not user:
             await m.answer("Сначала /start", reply_markup=ReplyKeyboardRemove())
+            return
+        if not is_user_verified(m.from_user.id):
+            await m.answer("🔒 Доступ не выдан. Нажми «📩 Запросить доступ» и дождись решения админа.", reply_markup=unauth_kb())
             return
 
         await state.clear()
@@ -706,6 +1024,9 @@ async def main():
         if not user:
             await m.answer("Сначала /start", reply_markup=ReplyKeyboardRemove())
             return
+        if not is_user_verified(m.from_user.id):
+            await m.answer("🔒 Доступ не выдан. Нажми «📩 Запросить доступ» и дождись решения админа.", reply_markup=unauth_kb())
+            return
 
         rows = list_last_grades(m.from_user.id, limit=10)
         if not rows:
@@ -743,6 +1064,9 @@ async def main():
         user = get_user(m.from_user.id)
         if not user:
             await m.answer("Сначала /start", reply_markup=ReplyKeyboardRemove())
+            return
+        if not is_user_verified(m.from_user.id):
+            await m.answer("🔒 Доступ не выдан. Нажми «📩 Запросить доступ» и дождись решения админа.", reply_markup=unauth_kb())
             return
         await state.clear()
         await m.answer("⚠️ Удалить ВСЕ твои оценки?\nНапиши: ДА (или нажми Отмена)", reply_markup=cancel_kb())
@@ -912,6 +1236,19 @@ async def main():
         target_id = data["target_id"]
         subject = data["subject"]
         add_grade_db(target_id, subject, g)
+
+        newly = []
+        cnt_total, avg_total2 = get_total_count_and_avg(target_id)
+        if cnt_total == 1 and unlock_achievement(target_id, "first_grade"):
+            newly.append("first_grade")
+        if cnt_total >= 10 and unlock_achievement(target_id, "ten_tests"):
+            newly.append("ten_tests")
+        last3 = get_last_grades(target_id, 3)
+        if len(last3) == 3 and all(x >= 5.0 for x in last3) and unlock_achievement(target_id, "streak3_5"):
+            newly.append("streak3_5")
+        if cnt_total >= 5 and (avg_total2 is not None) and float(avg_total2) >= 4.5 and unlock_achievement(target_id, "avg_45"):
+            newly.append("avg_45")
+
         u = get_user(target_id)
         log.info("admin add grade admin=%s target=%s subject=%s grade=%s", m.from_user.id, target_id, subject, g)
 
